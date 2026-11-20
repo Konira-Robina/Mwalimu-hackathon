@@ -72,6 +72,22 @@ def isolated_database(monkeypatch):
         yield TestSession
         engine.dispose()
 
+@pytest.fixture
+def real_seed_database(monkeypatch):
+    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+        engine = create_engine(
+            f"sqlite:///{(Path(directory) / 'real-seed-test.db').as_posix()}",
+            connect_args={"check_same_thread": False},
+        )
+        main.Base.metadata.create_all(engine)
+        TestSession = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        monkeypatch.setattr(main, "SessionLocal", TestSession)
+        monkeypatch.setattr(main.settings, "at_enabled", False)
+        monkeypatch.setattr(main.settings, "openrouter_api_key", "")
+        with TestClient(main.app) as client:
+            yield client
+        engine.dispose()
+
 
 def dial(client, session_id, phone, text, simulator=True, params=None):
     headers = {"X-Mwalimu-Simulator": "true"} if simulator else {}
@@ -81,6 +97,25 @@ def dial(client, session_id, phone, text, simulator=True, params=None):
         headers=headers,
         params=params,
     )
+
+def add_completed_attempt(db, student, assessment, question, option):
+    attempt = main.Attempt(
+        assessment_id=assessment.id,
+        student_id=student.id,
+        score=int(option.is_correct),
+        total=1,
+        completed=True,
+    )
+    db.add(attempt)
+    db.flush()
+    db.add(main.Response(
+        attempt_id=attempt.id,
+        question_id=question.id,
+        option_id=option.id,
+        correct=option.is_correct,
+        misconception_id=option.misconception_id,
+    ))
+    return attempt
 
 
 def test_registered_phone_quiz_returns_plain_text_with_real_newlines(isolated_database):
@@ -163,6 +198,100 @@ def test_followup_flow_recovery_and_airtime(isolated_database):
         assert len(rewards) == 1 and rewards[0]["phone"] == PHONE_1 and rewards[0]["status"] == "demo"
         texts = [m["message"] for m in client.get("/api/ussd/messages", headers=AUTH).json()]
         assert any("Airtime reward" in t for t in texts)
+
+
+def test_unassessable_followup_is_excluded_and_gets_no_reward(isolated_database):
+    TestSession = isolated_database
+    with TestClient(main.app) as client:
+        with TestSession() as db:
+            learner = db.query(main.Student).filter_by(phone_number=PHONE_1).one()
+            misconception = db.query(main.Misconception).one()
+            misconception_name = misconception.name
+            baseline = db.query(main.Assessment).filter_by(kind="baseline").one()
+            baseline_question = (
+                db.query(main.Question).join(main.Option)
+                .filter(main.Option.misconception_id == misconception.id).first()
+            )
+            baseline_option = db.query(main.Option).filter_by(
+                question_id=baseline_question.id, misconception_id=misconception.id
+            ).one()
+            add_completed_attempt(db, learner, baseline, baseline_question, baseline_option)
+
+            followup = main.Assessment(
+                class_id=learner.class_id, title="Unmatched follow-up", kind="followup"
+            )
+            question = main.Question(class_id=learner.class_id, text="Unrelated question?", topic="Other")
+            db.add_all([followup, question])
+            db.flush()
+            correct = main.Option(
+                question_id=question.id, label="A", text="Correct", is_correct=True
+            )
+            db.add_all([
+                correct,
+                main.Option(
+                    question_id=question.id, label="B", text="Wrong", is_correct=False
+                ),
+                main.AssessmentQuestion(
+                    assessment_id=followup.id, question_id=question.id, position=0
+                ),
+            ])
+            db.flush()
+            attempt = add_completed_attempt(db, learner, followup, question, correct)
+            attempt_id, learner_id = attempt.id, learner.id
+            db.commit()
+
+        overview = client.get("/api/dashboard/overview", headers=AUTH).json()
+        assert overview["recovery_eligible"] == 0
+        assert overview["recovery_recovered"] == 0
+        item = next(
+            item for item in client.get("/api/analytics/recovery", headers=AUTH).json()["items"]
+            if item["misconception"] == misconception_name
+        )
+        assert (item["eligible"], item["recovered"]) == (0, 0)
+
+        main.reward_recovery(learner_id, attempt_id, PHONE_1, True)
+        with TestSession() as db:
+            assert db.query(main.AirtimeReward).filter_by(student_id=learner_id).count() == 0
+
+
+def test_assessable_followup_counts_recovery(isolated_database):
+    TestSession = isolated_database
+    with TestClient(main.app) as client:
+        with TestSession() as db:
+            learner = db.query(main.Student).filter_by(phone_number=PHONE_1).one()
+            misconception = db.query(main.Misconception).one()
+            misconception_name = misconception.name
+            baseline = db.query(main.Assessment).filter_by(kind="baseline").one()
+            followup = db.query(main.Assessment).filter_by(kind="followup").one()
+            question = (
+                db.query(main.Question).join(main.Option)
+                .filter(main.Option.misconception_id == misconception.id).first()
+            )
+            wrong = db.query(main.Option).filter_by(
+                question_id=question.id, misconception_id=misconception.id
+            ).one()
+            correct = db.query(main.Option).filter_by(
+                question_id=question.id, is_correct=True
+            ).one()
+            add_completed_attempt(db, learner, baseline, question, wrong)
+            add_completed_attempt(db, learner, followup, question, correct)
+            db.commit()
+
+        overview = client.get("/api/dashboard/overview", headers=AUTH).json()
+        assert overview["recovery_eligible"] == 1
+        assert overview["recovery_recovered"] == 1
+        item = next(
+            item for item in client.get("/api/analytics/recovery", headers=AUTH).json()["items"]
+            if item["misconception"] == misconception_name
+        )
+        assert (item["eligible"], item["recovered"]) == (1, 1)
+
+
+def test_real_seed_recovery_counts(real_seed_database):
+    overview = real_seed_database.get("/api/dashboard/overview", headers=AUTH).json()
+    assert overview["recovery_eligible"] == 18
+    assert overview["recovery_recovered"] == 15
+    assert overview["recovery_rate"] == 83.3
 
 
 def test_no_airtime_for_typed_in_learner_id(isolated_database):

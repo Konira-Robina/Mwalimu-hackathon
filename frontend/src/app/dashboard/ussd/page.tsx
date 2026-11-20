@@ -274,6 +274,15 @@ export default function UssdSimulator() {
             <input className="field" inputMode="tel" value={phoneNumber} onChange={(e) => setPhoneNumber(e.target.value)} disabled={!!active && active.state === "ongoing"} placeholder="+256700000001" />
             <label className="label">Service code</label>
             <input className="field" value={serviceCode} onChange={(e) => setServiceCode(e.target.value)} disabled={!!active && active.state === "ongoing"} />
+            <input
+              className="field text-center text-base font-bold tracking-widest"
+              aria-label="USSD response"
+              value={selection}
+              onChange={(e) => setSelection(e.target.value.replace(/[^0-9]/g, ""))}
+              onKeyDown={(e) => { if (e.key === "Enter") void sendSelection(); }}
+              placeholder="Enter menu choice or learner ID"
+              disabled={busy || !active || active.state !== "ongoing"}
+            />
 
             <div className="grid grid-cols-3 gap-2 pt-1" aria-label="Numeric keypad">
               {["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "delete"].map((key, index) => (
@@ -291,15 +300,6 @@ export default function UssdSimulator() {
                 )
               ))}
             </div>
-            <input
-              className="field text-center text-base font-bold tracking-widest"
-              aria-label="USSD response"
-              value={selection}
-              onChange={(e) => setSelection(e.target.value.replace(/[^0-9]/g, ""))}
-              onKeyDown={(e) => { if (e.key === "Enter") void sendSelection(); }}
-              placeholder="Enter menu choice or learner ID"
-              disabled={busy || !active || active.state !== "ongoing"}
-            />
             {error && <p className="rounded-lg bg-red-50 p-3 text-xs text-red-700">{error}</p>}
             <div className="grid grid-cols-2 gap-2">
               {!active || active.state === "completed" ? (

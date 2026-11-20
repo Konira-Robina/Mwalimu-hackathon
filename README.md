@@ -46,11 +46,12 @@ Learners **026–030** (phones `+256700000026`–`030`) start with no attempts s
 
 ### Closing the loop
 - **Teacher action:** on *Misconceptions*, "Send revision SMS" texts a tip to learners whose latest attempt still shows that misconception (`POST /api/misconceptions/{id}/notify`).
-- **Airtime reward:** a learner who showed a misconception at baseline and no longer does in the follow-up gets airtime, once. Only for a phone that matches the registered learner, never for a typed-in ID. Off by default: set `AT_AIRTIME_ENABLED=true` (currency and amount are configurable). Without it the reward is recorded as `demo`. Check `GET /api/rewards`.
+- **Airtime reward:** a learner who showed a misconception at baseline and no longer selects it in an assessable follow-up gets airtime, once. Only for a phone that matches the registered learner, never for a typed-in ID. Off by default: set `AT_AIRTIME_ENABLED=true` (currency and amount are configurable). Without it the reward is recorded as `demo`. Check `GET /api/rewards`.
 
-## Notes
-- Wrong options are explicitly mapped to teacher-authored misconceptions; AI is not required for live classification.
-- A selected option is an indicator of a possible misconception, not proof of a learner's belief.
-- Recovery counts only learners who demonstrated a misconception at baseline, **completed a follow-up**, and no longer select an option mapped to it. Learners without a follow-up are excluded from the denominator.
-- Demo authentication is intentionally minimal. Replace it before production.
+## Known limitations
+- Demo authentication uses a fixed token and does not separate data by teacher.
+- Selecting a single wrong option indicates a possible misconception, not proof; with few options, a learner can pass by chance.
+- Seeded data is illustrative.
+- Recovery counts only learner–misconception pairs with a completed baseline showing the misconception and a completed follow-up that tests it with an option mapped to it. A pair is recovered when no follow-up response selects that misconception; pairs without a matching follow-up are excluded from the denominator. This baseline/follow-up comparison is not evidence of causal impact.
+- Airtime and SMS delivery were tested against the simulator and still need verification in the real Africa's Talking Sandbox.
 - Never commit `.env` or API credentials.

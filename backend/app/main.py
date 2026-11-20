@@ -293,16 +293,36 @@ def completed_cases(db,kind):
           .filter(Assessment.kind==kind,Attempt.completed==True,Response.misconception_id.isnot(None)).distinct().all())
     return {(sid,mid) for sid,mid in rows}
 
+def assessable_misconceptions(db,assessment_ids):
+    """Misconceptions detectable from questions in the given assessments."""
+    if not assessment_ids: return set()
+    rows=(db.query(Option.misconception_id)
+          .join(Question,Question.id==Option.question_id)
+          .join(AssessmentQuestion,AssessmentQuestion.question_id==Question.id)
+          .filter(AssessmentQuestion.assessment_id.in_(assessment_ids),Option.misconception_id.isnot(None))
+          .distinct().all())
+    return {mid for (mid,) in rows}
+
 def recovery_stats(db):
-    """Recovery only counts learners with a completed follow-up (matched pairs). Returns (per_misconception, eligible_learners, recovered_learners)."""
+    """Return recovery counts for baseline cases assessable in a completed follow-up."""
     base=completed_cases(db,"baseline"); follow=completed_cases(db,"followup")
-    followed={sid for (sid,) in db.query(Attempt.student_id).join(Assessment,Assessment.id==Attempt.assessment_id).filter(Assessment.kind=="followup",Attempt.completed==True).distinct()}
-    matched={(sid,mid) for sid,mid in base if sid in followed}
-    per={}; by_student={}
-    for sid,mid in matched:
-        e,r=per.get(mid,(0,0)); per[mid]=(e+1,r+((sid,mid) not in follow)); by_student.setdefault(sid,[]).append(mid)
-    recovered=sum(1 for sid,mids in by_student.items() if all((sid,m) not in follow for m in mids))
-    return per,len(by_student),recovered
+    attempts=(db.query(Attempt.student_id,Attempt.assessment_id)
+              .join(Assessment,Assessment.id==Attempt.assessment_id)
+              .filter(Assessment.kind=="followup",Attempt.completed==True).all())
+    assessments_by_student={}
+    for sid,assessment_id in attempts:
+        assessments_by_student.setdefault(sid,set()).add(assessment_id)
+    assessable_by_student={
+        sid:assessable_misconceptions(db,assessment_ids)
+        for sid,assessment_ids in assessments_by_student.items()
+    }
+    eligible={(sid,mid) for sid,mid in base if mid in assessable_by_student.get(sid,set())}
+    per={}
+    for sid,mid in eligible:
+        e,r=per.get(mid,(0,0)); per[mid]=(e+1,r+((sid,mid) not in follow))
+    eligible_count=sum(e for e,_ in per.values())
+    recovered_count=sum(r for _,r in per.values())
+    return per,eligible_count,recovered_count
 
 def currently_affected(db):
     """misconception_id -> learner ids whose most recent completed attempt still shows it."""
@@ -506,7 +526,11 @@ def reward_recovery(student_id,attempt_id,phone,force_demo):
     db=SessionLocal()
     try:
         if db.query(AirtimeReward).filter_by(student_id=student_id).first(): return
+        attempt=db.query(Attempt).filter_by(id=attempt_id,student_id=student_id,completed=True).first()
+        assessment=db.get(Assessment,attempt.assessment_id) if attempt else None
+        if not assessment or assessment.kind!="followup": return
         base={m for (m,) in db.query(Response.misconception_id).join(Attempt,Attempt.id==Response.attempt_id).join(Assessment,Assessment.id==Attempt.assessment_id).filter(Attempt.student_id==student_id,Assessment.kind=="baseline",Attempt.completed==True,Response.misconception_id.isnot(None)).distinct()}
+        base.intersection_update(assessable_misconceptions(db,{attempt.assessment_id}))
         shown={m for (m,) in db.query(Response.misconception_id).filter(Response.attempt_id==attempt_id,Response.misconception_id.isnot(None))}
         if not base or (base & shown): return
         status=airtime_send(phone,force_demo)
