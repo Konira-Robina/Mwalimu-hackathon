@@ -18,6 +18,7 @@ export default function Page() {
   const [rows, setRows] = useState<M[]>([]);
   const [busyId, setBusyId] = useState("");
   const [notes, setNotes] = useState<Record<string, string>>({});
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
 
   useEffect(() => {
     api<M[]>("/api/analytics/misconceptions").then(setRows).catch(() => {});
@@ -32,7 +33,7 @@ export default function Page() {
     try {
       const res = await api<{ queued: number }>(`/api/misconceptions/${m.id}/notify`, {
         method: "POST",
-        body: JSON.stringify({}),
+        body: JSON.stringify({ message: drafts[m.id] || undefined }),
       });
       setNotes((n) => ({ ...n, [m.id]: `Queued for ${res.queued} learner(s). Check the SMS inbox on the USSD page.` }));
     } catch (e) {
@@ -68,6 +69,7 @@ export default function Page() {
               <p className="mt-2 text-xs leading-5 text-slate-600">{m.intervention}</p>
             </div>
             <div className="mt-4 flex flex-wrap items-center gap-3">
+              <input className="field min-w-[240px] flex-1 text-xs" value={drafts[m.id] || ""} onChange={(e) => setDrafts((n) => ({ ...n, [m.id]: e.target.value }))} maxLength={300} placeholder="Optional teacher-written revision tip (up to 300 chars)" aria-label={`Revision tip for ${m.name}`} />
               <button
                 className="btn flex items-center gap-2 disabled:opacity-50"
                 disabled={m.currently_affected === 0 || busyId === m.id}
@@ -75,7 +77,7 @@ export default function Page() {
               >
                 <Send size={14} /> {busyId === m.id ? "Sending…" : `Send revision SMS (${m.currently_affected})`}
               </button>
-              {notes[m.id] && <p className="text-[11px] text-slate-500">{notes[m.id]}</p>}
+              {notes[m.id]?.startsWith("Queued for") && <p className="text-[11px] text-slate-500">{notes[m.id]}</p>}
             </div>
             <p className="mt-3 text-[10px] text-slate-400">{m.response_count} incorrect responses · A selected option is an indicator, not proof.</p>
           </article>

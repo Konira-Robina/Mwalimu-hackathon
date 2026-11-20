@@ -42,6 +42,7 @@ type Conversation = {
 };
 
 type UssdStatus = { configured: boolean; mode: string };
+type UssdAnalytics = { session_count: number; average_duration_seconds: number | null; sessions: { session_id: string; duration_seconds: number | null; status: string; source: string; created_at: string | null }[] };
 
 function formatDate(date: string | null) {
   if (!date) return "Time unavailable";
@@ -67,6 +68,7 @@ export default function UssdSimulator() {
   const [selection, setSelection] = useState("");
   const [messages, setMessages] = useState<SmsMessage[]>([]);
   const [network, setNetwork] = useState<UssdStatus | null>(null);
+  const [ussdAnalytics, setUssdAnalytics] = useState<UssdAnalytics | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const screenRef = useRef<HTMLDivElement>(null);
@@ -77,6 +79,11 @@ export default function UssdSimulator() {
       .then(setNetwork)
       .catch(() => setNetwork(null));
   }, []);
+
+  async function refreshAnalytics() {
+    try { setUssdAnalytics(await api<UssdAnalytics>("/api/analytics/ussd-sessions")); } catch { /* analytics is optional */ }
+  }
+  useEffect(() => { void refreshAnalytics(); }, []);
 
   useEffect(() => {
     screenRef.current?.scrollTo({ top: screenRef.current.scrollHeight, behavior: "smooth" });
@@ -98,6 +105,7 @@ export default function UssdSimulator() {
       await new Promise((resolve) => setTimeout(resolve, wait));
       try {
         setMessages(await api<SmsMessage[]>("/api/ussd/messages"));
+        await refreshAnalytics();
       } catch {
         /* keep the last known inbox */
       }
@@ -213,7 +221,7 @@ export default function UssdSimulator() {
           <p className="eyebrow">Understand. Teach. Improve.</p>
           <h1 className="mt-2 text-2xl font-bold">USSD Simulator</h1>
           <p className="mt-1 max-w-2xl text-sm text-slate-500">
-            Try the learner quiz journey through Mwalimu’s existing USSD service. This is a simulation, not a mobile network connection.
+            Try the learner quiz journey through Mwalimu’s existing USSD service. This is a simulation, not a mobile network connection. Choose 2 then 1 for the Luganda journey.
           </p>
         </div>
         <span className="rounded-full bg-indigo-50 px-3 py-2 text-xs font-semibold text-indigo-700">{networkLabel}</span>
@@ -332,13 +340,13 @@ export default function UssdSimulator() {
                   <article key={message.id} className="rounded-xl border border-slate-100 p-4">
                     <div className="flex flex-wrap items-start justify-between gap-2">
                       <p className="text-xs font-semibold text-slate-700">To {message.recipient}</p>
-                      <span className={`rounded-full px-2.5 py-1 text-[10px] font-bold ${message.delivery_status === "accepted" || message.delivery_status === "sandbox_accepted" ? "bg-sky-50 text-sky-700" : message.delivery_status === "failed" ? "bg-red-50 text-red-700" : "bg-amber-50 text-amber-800"}`}>
-                        {message.delivery_status === "sandbox_accepted" ? "Accepted by Africa’s Talking Sandbox" : message.delivery_status === "accepted" ? "Accepted by provider" : message.delivery_status === "failed" ? "Provider failed" : "Simulated locally"}
+                      <span className={`rounded-full px-2.5 py-1 text-[10px] font-bold ${["accepted", "sandbox_accepted", "delivered", "success"].includes(message.delivery_status) ? "bg-sky-50 text-sky-700" : ["failed", "rejected", "expired"].includes(message.delivery_status) ? "bg-red-50 text-red-700" : "bg-amber-50 text-amber-800"}`}>
+                        {message.delivery_status === "sandbox_accepted" ? "Accepted by Africa’s Talking Sandbox" : message.delivery_status === "accepted" ? "Accepted by provider" : ["delivered", "success"].includes(message.delivery_status) ? "Delivered" : ["failed", "rejected", "expired"].includes(message.delivery_status) ? `Provider ${message.delivery_status}` : message.delivery_status === "pending_delivery" ? "Awaiting delivery report" : message.delivery_status === "demo" ? "Simulated locally" : message.delivery_status}
                       </span>
                     </div>
                     <p className="mt-1 flex items-center gap-1 text-[10px] text-slate-400"><Clock3 size={12} />{formatDate(message.created_at)}</p>
                     <p className="mt-3 whitespace-pre-wrap text-sm leading-5 text-slate-700">{displayMessage(message.message)}</p>
-                    {(message.delivery_status === "accepted" || message.delivery_status === "sandbox_accepted") && <p className="mt-2 text-[10px] text-sky-700">Provider acceptance does not confirm handset delivery.</p>}
+                    {(["accepted", "sandbox_accepted", "pending_delivery", "submitted", "buffered"].includes(message.delivery_status)) && <p className="mt-2 text-[10px] text-sky-700">Provider acceptance does not confirm handset delivery.</p>}
                   </article>
                 ))}
               </div>
@@ -382,6 +390,13 @@ export default function UssdSimulator() {
                 ))}
               </div>
             )}
+          </section>
+
+          <section className="card p-5">
+            <div className="flex items-center justify-between"><h2 className="font-bold">USSD session analytics</h2><button className="text-xs font-semibold text-indigo-600" onClick={() => void refreshAnalytics()}>Refresh</button></div>
+            <p className="mt-2 text-sm text-slate-600">{ussdAnalytics?.session_count ?? 0} recorded sessions · average {ussdAnalytics?.average_duration_seconds == null ? "—" : `${ussdAnalytics.average_duration_seconds}s`}</p>
+            <p className="mt-1 text-[10px] text-slate-400">Includes local simulator sessions and Africa’s Talking session events.</p>
+            {!!ussdAnalytics?.sessions.length && <div className="mt-3 space-y-2">{ussdAnalytics.sessions.slice(0, 5).map((event) => <div className="flex justify-between rounded-lg bg-slate-50 p-3 text-xs" key={event.session_id}><span>{event.source === "web_simulator" ? "Local simulator" : "Africa’s Talking"} · {event.status}</span><span>{event.duration_seconds == null ? "Duration unknown" : `${event.duration_seconds}s`}</span></div>)}</div>}
           </section>
           <p className="flex items-start gap-2 rounded-xl bg-indigo-50 p-4 text-xs leading-5 text-indigo-800">
             <CheckCircle2 className="mt-0.5 shrink-0" size={15} /> The simulator sends each response to the existing Mwalimu callback. The backend’s menu, score, and feedback remain authoritative.

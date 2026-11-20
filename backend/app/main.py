@@ -1,9 +1,9 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
-import asyncio, json, logging
+import asyncio, json, logging, secrets, hashlib
 from typing import Optional
-from fastapi import FastAPI, Depends, HTTPException, Form, Header, Query, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, Form, Header, Query, BackgroundTasks, Request
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     at_airtime_amount: int = 500
     at_airtime_currency: str = "UGX"
     ussd_callback_secret: str = ""
+    at_sms_callback_secret: str = ""
+    at_airtime_callback_secret: str = ""
+    at_ussd_event_secret: str = ""
+    session_ttl_hours: int = 12
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 settings = Settings()
 engine = create_engine(settings.database_url, connect_args={"check_same_thread":False} if settings.database_url.startswith("sqlite") else {})
@@ -41,6 +45,11 @@ class Teacher(Base):
     id:Mapped[str]=mapped_column(String(36),primary_key=True,default=lambda:str(uuid4()))
     name:Mapped[str]=mapped_column(String(120)); email:Mapped[str]=mapped_column(String(180),unique=True)
     password_hash:Mapped[str]=mapped_column(String(255))
+class TeacherSession(Base):
+    __tablename__="teacher_sessions"
+    token_hash:Mapped[str]=mapped_column(String(64),primary_key=True)
+    teacher_id:Mapped[str]=mapped_column(ForeignKey("teachers.id"),index=True)
+    expires_at:Mapped[int]=mapped_column(Integer,index=True)
 class SchoolClass(Base):
     __tablename__="classes"
     id:Mapped[str]=mapped_column(String(36),primary_key=True,default=lambda:str(uuid4()))
@@ -58,17 +67,17 @@ class Misconception(Base):
 class Question(Base):
     __tablename__="questions"
     id:Mapped[str]=mapped_column(String(36),primary_key=True,default=lambda:str(uuid4()))
-    class_id:Mapped[str]=mapped_column(ForeignKey("classes.id")); text:Mapped[str]=mapped_column(Text)
+    class_id:Mapped[str]=mapped_column(ForeignKey("classes.id")); text:Mapped[str]=mapped_column(Text); text_lg:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
     topic:Mapped[str]=mapped_column(String(100)); explanation:Mapped[str]=mapped_column(Text,default="")
     options:Mapped[list["Option"]]=relationship(back_populates="question",cascade="all, delete-orphan")
 class Option(Base):
     __tablename__="answer_options"
     id:Mapped[str]=mapped_column(String(36),primary_key=True,default=lambda:str(uuid4()))
     question_id:Mapped[str]=mapped_column(ForeignKey("questions.id"),index=True)
-    label:Mapped[str]=mapped_column(String(2)); text:Mapped[str]=mapped_column(Text)
+    label:Mapped[str]=mapped_column(String(2)); text:Mapped[str]=mapped_column(Text); text_lg:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
     is_correct:Mapped[bool]=mapped_column(Boolean,default=False)
     misconception_id:Mapped[Optional[str]]=mapped_column(ForeignKey("misconceptions.id"),nullable=True)
-    feedback:Mapped[str]=mapped_column(Text,default="")
+    feedback:Mapped[str]=mapped_column(Text,default=""); feedback_lg:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
     question:Mapped[Question]=relationship(back_populates="options")
     misconception:Mapped[Optional[Misconception]]=relationship()
 class Assessment(Base):
@@ -102,12 +111,37 @@ class UssdSession(Base):
     phone:Mapped[str]=mapped_column(String(30)); student_id:Mapped[Optional[str]]=mapped_column(ForeignKey("students.id"),nullable=True)
     assessment_id:Mapped[Optional[str]]=mapped_column(ForeignKey("assessments.id"),nullable=True)
     attempt_id:Mapped[Optional[str]]=mapped_column(ForeignKey("quiz_attempts.id"),nullable=True)
+    language:Mapped[str]=mapped_column(String(8),default="en")
+    started_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+
+class UssdEvent(Base):
+    __tablename__="ussd_events"
+    session_id:Mapped[str]=mapped_column(String(120),primary_key=True)
+    phone:Mapped[str]=mapped_column(String(30),default="")
+    duration_seconds:Mapped[Optional[int]]=mapped_column(Integer,nullable=True)
+    cost:Mapped[Optional[str]]=mapped_column(String(40),nullable=True)
+    currency:Mapped[Optional[str]]=mapped_column(String(8),nullable=True)
+    status:Mapped[str]=mapped_column(String(40),default="unknown")
+    source:Mapped[str]=mapped_column(String(20),default="africas_talking")
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+
+class ATCallbackEvent(Base):
+    __tablename__="at_callback_events"
+    id:Mapped[str]=mapped_column(String(36),primary_key=True,default=lambda:str(uuid4()))
+    service:Mapped[str]=mapped_column(String(20),index=True)
+    provider_id:Mapped[str]=mapped_column(String(100),index=True)
+    status:Mapped[str]=mapped_column(String(40))
+    payload:Mapped[str]=mapped_column(Text,default="{}")
+    processed:Mapped[bool]=mapped_column(Boolean,default=False,index=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
 
 class SmsMessage(Base):
     __tablename__="sms_messages"
     id:Mapped[str]=mapped_column(String(36),primary_key=True,default=lambda:str(uuid4()))
     recipient:Mapped[str]=mapped_column(String(30),index=True)
     message:Mapped[str]=mapped_column(Text)
+    provider_message_id:Mapped[Optional[str]]=mapped_column(String(100),nullable=True,index=True)
+    response_id:Mapped[Optional[str]]=mapped_column(ForeignKey("student_responses.id"),nullable=True,index=True)
     delivery_status:Mapped[str]=mapped_column(String(20),default="demo")
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
 
@@ -117,20 +151,37 @@ class AirtimeReward(Base):
     student_id:Mapped[str]=mapped_column(ForeignKey("students.id"),index=True)
     attempt_id:Mapped[str]=mapped_column(ForeignKey("quiz_attempts.id"),index=True)
     phone:Mapped[str]=mapped_column(String(30)); amount:Mapped[int]=mapped_column(Integer); currency:Mapped[str]=mapped_column(String(3))
+    provider_request_id:Mapped[Optional[str]]=mapped_column(String(100),nullable=True,index=True)
     status:Mapped[str]=mapped_column(String(20),default="demo")
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
 
+class PilotObservation(Base):
+    __tablename__="pilot_observations"
+    id:Mapped[str]=mapped_column(String(36),primary_key=True,default=lambda:str(uuid4()))
+    observed_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+    context:Mapped[str]=mapped_column(String(120))
+    participant_count:Mapped[int]=mapped_column(Integer,default=1)
+    note:Mapped[str]=mapped_column(Text)
+    consent_to_quote:Mapped[bool]=mapped_column(Boolean,default=False)
+
 Base.metadata.create_all(engine)
+if settings.database_url.startswith("sqlite"):
+    # Keep existing local demo databases usable as optional Luganda fields are added.
+    with engine.begin() as connection:
+        for table, column in (("questions", "text_lg"), ("answer_options", "text_lg"), ("answer_options", "feedback_lg"), ("sms_messages", "provider_message_id"), ("sms_messages", "response_id"), ("airtime_rewards", "provider_request_id"), ("ussd_sessions", "started_at"), ("ussd_events", "source")):
+            existing={row[1] for row in connection.exec_driver_sql(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
 def db_dep():
     db=SessionLocal()
     try: yield db
     finally: db.close()
 
-def sms_send(phone,message,force_demo=False):
+def sms_send_detailed(phone,message,force_demo=False):
     if force_demo:
-        logging.info("SIMULATOR DEMO SMS to %s: %s",phone,message); return "demo"
+        logging.info("SIMULATOR DEMO SMS to %s: %s",phone,message); return "demo",None
     if not settings.at_enabled or not settings.at_api_key:
-        logging.info("DEMO SMS to %s: %s",phone,message); return "demo"
+        logging.info("DEMO SMS to %s: %s",phone,message); return "demo",None
     try:
         import africastalking
         africastalking.initialize(settings.at_username,settings.at_api_key)
@@ -141,38 +192,71 @@ def sms_send(phone,message,force_demo=False):
         recipients=((result or {}).get("SMSMessageData") or {}).get("Recipients") or []
         # 100 processed, 101 sent, 102 queued. Anything else means the gateway refused it.
         if any(str(r.get("statusCode")) not in {"100","101","102"} for r in recipients):
-            logging.warning("AT SMS not accepted: %s",result); return "failed"
-        return "accepted"
+            logging.warning("AT SMS not accepted: %s",result); return "failed",None
+        provider_id=next((str(r.get("messageId")) for r in recipients if r.get("messageId")),None)
+        return "accepted",provider_id
     except Exception:
-        logging.exception("SMS failed"); return "failed"
+        logging.exception("SMS failed"); return "failed",None
 
-def airtime_send(phone,force_demo=False):
+def sms_send(phone,message,force_demo=False):
+    return sms_send_detailed(phone,message,force_demo)[0]
+
+def airtime_send_detailed(phone,force_demo=False):
     if force_demo or not (settings.at_enabled and settings.at_api_key and settings.at_airtime_enabled):
-        logging.info("DEMO AIRTIME %s %s to %s",settings.at_airtime_currency,settings.at_airtime_amount,phone); return "demo"
+        logging.info("DEMO AIRTIME %s %s to %s",settings.at_airtime_currency,settings.at_airtime_amount,phone); return "demo",None
     try:
         import africastalking
         africastalking.initialize(settings.at_username,settings.at_api_key)
         result=africastalking.Airtime.send(phone_number=phone,amount=settings.at_airtime_amount,currency_code=settings.at_airtime_currency)
         logging.info("AT airtime response: %s",result)
-        return "accepted" if int((result or {}).get("numSent",0))>0 else "failed"
+        rows=(result or {}).get("responses") or []
+        provider_id=next((str(r.get("requestId")) for r in rows if r.get("requestId")),None)
+        # numSent means accepted for telco processing, not delivered to the handset.
+        return ("pending_delivery",provider_id) if int((result or {}).get("numSent",0))>0 else ("failed",provider_id)
     except Exception:
-        logging.exception("Airtime failed"); return "failed"
+        logging.exception("Airtime failed"); return "failed",None
 
-def record_sms(phone,message,status):
+def airtime_send(phone,force_demo=False):
+    return airtime_send_detailed(phone,force_demo)[0]
+
+def update_sms_status(db,message,status):
+    message.delivery_status=status
+    if message.response_id:
+        response=db.get(Response,message.response_id)
+        if response: response.sms_status=status
+
+def apply_pending_sms_events(db,message):
+    if not message.provider_message_id: return
+    events=db.query(ATCallbackEvent).filter_by(service="sms",provider_id=message.provider_message_id,processed=False).order_by(ATCallbackEvent.created_at.asc()).all()
+    for event in events:
+        update_sms_status(db,message,normalize_delivery_status(event.status));event.processed=True
+
+def record_sms(phone,message,status,provider_message_id=None,response_id=None):
     db=SessionLocal()
     try:
-        db.add(SmsMessage(recipient=phone,message=message,delivery_status="sandbox_accepted" if status=="accepted" and settings.at_username=="sandbox" else status));db.commit()
+        stored_status="sandbox_accepted" if status=="accepted" and settings.at_username=="sandbox" else status
+        row=SmsMessage(recipient=phone,message=message,delivery_status=stored_status,provider_message_id=provider_message_id,response_id=response_id)
+        db.add(row);db.flush();apply_pending_sms_events(db,row);db.commit()
     except Exception:
         db.rollback();logging.exception("Could not log SMS")
     finally: db.close()
 
-async def generate_learning_explanation(question: str, correct_answer: str, selected_answer: str, misconception: str, teacher_feedback: str = "") -> str:
+def normalize_delivery_status(value):
+    status=(value or "").strip().lower().replace(" ","_")
+    if status in {"success","delivered","delivery_success"}: return "delivered"
+    if status in {"failed","rejected","expired","deliveryfailure","not_delivered"}: return "failed"
+    if status in {"buffered","queued"}: return "buffered"
+    if status in {"submitted","sent","accepted","processed"}: return "submitted"
+    return "pending_delivery"
+
+async def generate_learning_explanation(question: str, correct_answer: str, selected_answer: str, misconception: str, teacher_feedback: str = "", language: str = "en") -> str:
     """Generate a short learner-friendly explanation; fall back to teacher-authored feedback."""
-    fallback = teacher_feedback.strip() or f"The correct answer is: {correct_answer}. Review this idea and try again."
+    fallback = teacher_feedback.strip() or (f"Ekiddamu kituufu kye kino: {correct_answer}. Ddamu okwetegereza ekirowoozo kino." if language == "lg" else f"The correct answer is: {correct_answer}. Review this idea and try again.")
     if not settings.openrouter_api_key:
         return fallback
     prompt = (
-        "You are a kind, clear secondary-school science tutor. Explain the learner's likely misconception "
+        ("You are a kind, clear Luganda-speaking secondary-school science tutor. Write the entire explanation in simple Luganda, preserving scientific meaning. " if language == "lg" else "You are a kind, clear secondary-school science tutor. ") +
+        "Explain the learner's likely misconception "
         "in simple language suitable for an SMS. Do not shame the learner. Do not diagnose beyond the "
         "provided misconception. Give one short correction and, if useful, one simple example. "
         "Return plain text only, maximum 320 characters.\n\n"
@@ -249,17 +333,58 @@ def seed(db):
                 if selected.is_correct: attempt.score+=1
     db.commit()
 
+def add_demo_luganda_content(db):
+    """Add starter Luganda wording to the seeded science quiz, including pre-existing demo DBs."""
+    questions={
+        "What happens during evaporation?":"Kiki ekibaawo amazzi bwe gafuka omukka?",
+        "What happens when ice melts?":"Kiki ekibaawo omuzira bwe gusaanuuka?",
+        "What happens when liquid water freezes?":"Kiki ekibaawo amazzi agali mu mbeera y'obwangu bwe gakwatibwa obunnyogovu?",
+    }
+    options={
+        "Water turns into ice":"Amazzi gafuuka omuzira",
+        "Water changes into water vapour":"Amazzi gafuuka omukka ogutalabika",
+        "Water disappears completely":"Amazzi gabula ddala",
+        "Solid water changes into liquid water":"Amazzi amakalu gafuuka amazzi agakulukuta",
+        "Water becomes a different substance":"Amazzi gafuuka ekintu ekirala",
+        "Water is destroyed":"Amazzi gazikirizibwa",
+        "It changes into water vapour":"Gafuuka omukka ogutalabika",
+        "It changes into solid ice":"Gafuuka omuzira omukalu",
+        "The water is destroyed":"Amazzi gazikirizibwa",
+    }
+    feedback={
+        "Evaporation is different from freezing. Water changes from liquid into water vapour.":"Okufuuka omukka si kye kimu n'okukwatibwa obunnyogovu. Amazzi gafuuka omukka ogutalabika.",
+        "Water does not disappear. It changes into water vapour that mixes with the air.":"Amazzi tegabula. Gafuuka omukka ogutalabika ne gutabuka n'empewo.",
+        "Melting is a physical change of state. The substance remains water.":"Okusaanuuka kukyusa mbeera ya mazzi; amazzi gasigala nga mazzi.",
+        "Water is not destroyed when ice melts; it changes from solid to liquid.":"Amazzi tegazikirizibwa omuzira bwe gusaanuuka; gava ku mukalu ne gafuuka agakulukuta.",
+        "Freezing changes liquid water into solid ice, not water vapour.":"Okukwatibwa obunnyogovu kufuula amazzi omuzira omukalu, so si mukka.",
+        "Freezing does not destroy water. It changes liquid water into a solid.":"Okukwatibwa obunnyogovu tekuzikiriza mazzi. Kugafuula mukalu.",
+    }
+    for q in db.query(Question).all():
+        if q.text in questions and not q.text_lg: q.text_lg=questions[q.text]
+        for option in q.options:
+            if option.text in options and not option.text_lg: option.text_lg=options[option.text]
+            if option.feedback in feedback and not option.feedback_lg: option.feedback_lg=feedback[option.feedback]
+    db.commit()
+
 @asynccontextmanager
 async def lifespan(_app):
     d=SessionLocal()
-    try: seed(d)
+    try: seed(d); add_demo_luganda_content(d)
     finally: d.close()
     yield
 
 app=FastAPI(lifespan=lifespan,title="Mwalimu | Understand. Teach. Improve.",version="1.0.0",description="An AI-powered learning recovery platform that helps teachers identify learner misconceptions, provide personalised feedback, and measure learning progress.")
 app.add_middleware(CORSMiddleware,allow_origins=[settings.frontend_origin,"http://localhost:3000"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 def auth(authorization:Optional[str]=Header(default=None)):
-    if authorization!="Bearer radar-demo-token": raise HTTPException(401,"Please sign in.")
+    token=authorization.removeprefix("Bearer ").strip() if authorization and authorization.startswith("Bearer ") else ""
+    if not token: raise HTTPException(401,"Please sign in.")
+    db=SessionLocal()
+    try:
+        record=db.get(TeacherSession,hashlib.sha256(token.encode()).hexdigest())
+        if not record or record.expires_at < int(datetime.now(timezone.utc).timestamp()):
+            if record: db.delete(record); db.commit()
+            raise HTTPException(401,"Your session expired. Please sign in again.")
+    finally: db.close()
 @app.get("/health")
 def health(): return {"status":"ok"}
 
@@ -269,11 +394,12 @@ class ExplanationIn(BaseModel):
     selected_answer: str
     misconception: str
     teacher_feedback: str = ""
+    language: str = "en"
 
 @app.post("/api/ai/explanation", dependencies=[Depends(auth)])
 async def ai_explanation(x: ExplanationIn):
     explanation = await generate_learning_explanation(
-        x.question, x.correct_answer, x.selected_answer, x.misconception, x.teacher_feedback
+        x.question, x.correct_answer, x.selected_answer, x.misconception, x.teacher_feedback, x.language
     )
     return {
         "explanation": explanation,
@@ -285,7 +411,16 @@ class Login(BaseModel): email:str; password:str
 def login(x:Login,db:Session=Depends(db_dep)):
     t=db.query(Teacher).filter(func.lower(Teacher.email)==x.email.lower()).first()
     if not t or not pwd.verify(x.password,t.password_hash): raise HTTPException(401,"Invalid email or password.")
-    return {"access_token":"radar-demo-token","teacher":{"name":t.name,"email":t.email}}
+    token=secrets.token_urlsafe(32)
+    db.add(TeacherSession(token_hash=hashlib.sha256(token.encode()).hexdigest(),teacher_id=t.id,expires_at=int(datetime.now(timezone.utc).timestamp())+settings.session_ttl_hours*3600))
+    db.commit()
+    return {"access_token":token,"expires_in":settings.session_ttl_hours*3600,"teacher":{"name":t.name,"email":t.email}}
+@app.post("/api/auth/logout",dependencies=[Depends(auth)])
+def logout(authorization:Optional[str]=Header(default=None),db:Session=Depends(db_dep)):
+    token=authorization.removeprefix("Bearer ").strip() if authorization else ""
+    record=db.get(TeacherSession,hashlib.sha256(token.encode()).hexdigest())
+    if record: db.delete(record); db.commit()
+    return {"ok":True}
 def completed_cases(db,kind):
     """Set of (student_id, misconception_id) shown in completed attempts of one assessment kind."""
     rows=(db.query(Attempt.student_id,Response.misconception_id)
@@ -396,23 +531,23 @@ class ClassIn(BaseModel): name:str; subject:str="Science"
 def add_class(x:ClassIn,db:Session=Depends(db_dep)):
     t=db.query(Teacher).first();c=SchoolClass(teacher_id=t.id,name=x.name,subject=x.subject);db.add(c);db.commit();return {"id":c.id,"name":c.name,"subject":c.subject,"student_count":0}
 def q_json(q):
-    return {"id":q.id,"text":q.text,"topic":q.topic,"options":[{"id":o.id,"label":o.label,"text":o.text,"is_correct":o.is_correct,"misconception":o.misconception.name if o.misconception else None,"feedback":o.feedback} for o in q.options]}
+    return {"id":q.id,"text":q.text,"text_lg":q.text_lg,"topic":q.topic,"options":[{"id":o.id,"label":o.label,"text":o.text,"text_lg":o.text_lg,"is_correct":o.is_correct,"misconception":o.misconception.name if o.misconception else None,"feedback":o.feedback,"feedback_lg":o.feedback_lg} for o in q.options]}
 @app.get("/api/questions",dependencies=[Depends(auth)])
 def questions(db:Session=Depends(db_dep)): return [q_json(q) for q in db.query(Question).all()]
 class OptIn(BaseModel):
-    label:str; text:str; is_correct:bool=False; misconception_name:Optional[str]=None; feedback:str=""
+    label:str; text:str; text_lg:Optional[str]=None; is_correct:bool=False; misconception_name:Optional[str]=None; feedback:str=""; feedback_lg:Optional[str]=None
 class QuestionIn(BaseModel):
-    class_id:str; text:str; topic:str; options:list[OptIn]
+    class_id:str; text:str; text_lg:Optional[str]=None; topic:str; options:list[OptIn]
 @app.post("/api/questions",dependencies=[Depends(auth)])
 def add_question(x:QuestionIn,db:Session=Depends(db_dep)):
     if len(x.options)<2 or sum(o.is_correct for o in x.options)!=1: raise HTTPException(400,"Provide at least two options and exactly one correct answer.")
-    q=Question(class_id=x.class_id,text=x.text,topic=x.topic);db.add(q);db.flush()
+    q=Question(class_id=x.class_id,text=x.text,text_lg=x.text_lg,topic=x.topic);db.add(q);db.flush()
     for o in x.options:
         mc=None
         if not o.is_correct and o.misconception_name:
             mc=db.query(Misconception).filter_by(name=o.misconception_name).first()
             if not mc: mc=Misconception(name=o.misconception_name,description=o.misconception_name,topic=x.topic,intervention="Review this concept with the class.");db.add(mc);db.flush()
-        db.add(Option(question_id=q.id,label=o.label,text=o.text,is_correct=o.is_correct,misconception_id=mc.id if mc else None,feedback=o.feedback))
+        db.add(Option(question_id=q.id,label=o.label,text=o.text,text_lg=o.text_lg,is_correct=o.is_correct,misconception_id=mc.id if mc else None,feedback=o.feedback,feedback_lg=o.feedback_lg))
     db.commit();db.refresh(q);return q_json(q)
 @app.get("/api/analytics/misconceptions",dependencies=[Depends(auth)])
 def misconceptions(db:Session=Depends(db_dep)):
@@ -431,7 +566,9 @@ def recovery(db:Session=Depends(db_dep)):
 
 class NotifyIn(BaseModel): message:Optional[str]=Field(default=None,max_length=300)
 def deliver_sms_batch(phones,message):
-    for phone in phones: record_sms(phone,message,sms_send(phone,message))
+    for phone in phones:
+        status,provider_id=sms_send_detailed(phone,message)
+        record_sms(phone,message,status,provider_id)
 @app.post("/api/misconceptions/{misconception_id}/notify",dependencies=[Depends(auth)])
 def notify_affected(misconception_id:str,background:BackgroundTasks,x:Optional[NotifyIn]=None,db:Session=Depends(db_dep)):
     """Close the loop: SMS a revision tip to learners whose latest attempt still shows this misconception."""
@@ -464,8 +601,88 @@ def rewards(db:Session=Depends(db_dep)):
 @app.get("/api/assessments",dependencies=[Depends(auth)])
 def assessments(db:Session=Depends(db_dep)):
     return [{"id":a.id,"title":a.title,"type":a.kind,"question_count":len(a.questions),"published":True} for a in db.query(Assessment).all()]
+
+class PilotObservationIn(BaseModel):
+    context:str=Field(min_length=2,max_length=120)
+    participant_count:int=Field(ge=1,le=1000)
+    note:str=Field(min_length=5,max_length=1200)
+    consent_to_quote:bool=False
+@app.get("/api/pilot/observations",dependencies=[Depends(auth)])
+def list_pilot_observations(db:Session=Depends(db_dep)):
+    rows=db.query(PilotObservation).order_by(PilotObservation.observed_at.desc()).limit(100).all()
+    return [{"id":r.id,"observed_at":r.observed_at.isoformat(),"context":r.context,"participant_count":r.participant_count,"note":r.note,"consent_to_quote":r.consent_to_quote,"evidence_label":"Self-reported; not independently verified"} for r in rows]
+@app.post("/api/pilot/observations",dependencies=[Depends(auth)])
+def add_pilot_observation(x:PilotObservationIn,db:Session=Depends(db_dep)):
+    row=PilotObservation(**x.model_dump());db.add(row);db.commit();db.refresh(row)
+    return {"id":row.id,"observed_at":row.observed_at.isoformat(),"evidence_label":"Self-reported; not independently verified"}
 @app.get("/api/ussd/status")
 def ussd_status(): return {"configured":settings.at_enabled and bool(settings.at_api_key),"mode":"sandbox" if settings.at_username=="sandbox" else "live"}
+
+async def callback_data(request:Request):
+    content_type=(request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        data=await request.json()
+    else:
+        data=dict(await request.form())
+    return data if isinstance(data,dict) else {}
+
+def verify_callback_key(key,expected):
+    if expected and key!=expected: raise HTTPException(403,"Forbidden")
+
+def save_at_event(db,service,provider_id,status,payload,processed):
+    db.add(ATCallbackEvent(service=service,provider_id=provider_id,status=status,payload=json.dumps(payload,default=str),processed=processed))
+
+@app.post("/api/at/sms/delivery-report")
+async def at_sms_delivery_report(request:Request,key:str=Query(default=""),db:Session=Depends(db_dep)):
+    verify_callback_key(key,settings.at_sms_callback_secret)
+    payload=await callback_data(request)
+    provider_id=str(payload.get("messageId") or payload.get("message_id") or payload.get("id") or "").strip()
+    raw_status=str(payload.get("status") or payload.get("deliveryStatus") or "").strip()
+    if not provider_id or not raw_status: raise HTTPException(400,"Expected messageId/id and status.")
+    row=db.query(SmsMessage).filter_by(provider_message_id=provider_id).first()
+    if row: update_sms_status(db,row,normalize_delivery_status(raw_status))
+    save_at_event(db,"sms",provider_id,raw_status,payload,processed=bool(row))
+    db.commit()
+    return {"ok":True,"matched":bool(row)}
+
+@app.post("/api/at/airtime/delivery-report")
+async def at_airtime_delivery_report(request:Request,key:str=Query(default=""),db:Session=Depends(db_dep)):
+    verify_callback_key(key,settings.at_airtime_callback_secret)
+    payload=await callback_data(request)
+    provider_id=str(payload.get("requestId") or payload.get("request_id") or payload.get("transactionId") or "").strip()
+    raw_status=str(payload.get("status") or "").strip()
+    if not provider_id or not raw_status: raise HTTPException(400,"Expected requestId and status.")
+    row=db.query(AirtimeReward).filter_by(provider_request_id=provider_id).first()
+    if row: row.status=normalize_delivery_status(raw_status)
+    save_at_event(db,"airtime",provider_id,raw_status,payload,processed=bool(row))
+    db.commit()
+    return {"ok":True,"matched":bool(row)}
+
+@app.post("/api/at/ussd/event")
+async def at_ussd_event(request:Request,key:str=Query(default=""),db:Session=Depends(db_dep)):
+    verify_callback_key(key,settings.at_ussd_event_secret)
+    payload=await callback_data(request)
+    session_id=str(payload.get("sessionId") or payload.get("session_id") or "").strip()
+    if not session_id: raise HTTPException(400,"Expected sessionId.")
+    duration_raw=payload.get("duration") or payload.get("durationInSeconds") or payload.get("durationSeconds")
+    try: duration=int(float(duration_raw)) if duration_raw not in (None,"") else None
+    except (ValueError,TypeError): duration=None
+    cost=payload.get("cost")
+    values={"phone":str(payload.get("phoneNumber") or payload.get("phone") or ""),"duration_seconds":duration,"cost":str(cost) if cost not in (None,"") else None,"currency":str(payload.get("currencyCode") or payload.get("currency") or "") or None,"status":str(payload.get("status") or "unknown")}
+    row=db.get(UssdEvent,session_id)
+    if row:
+        for field,value in values.items(): setattr(row,field,value)
+        row.created_at=now()
+    else: db.add(UssdEvent(session_id=session_id,**values))
+    db.commit()
+    return {"ok":True}
+
+@app.get("/api/analytics/ussd-sessions",dependencies=[Depends(auth)])
+def ussd_session_analytics(db:Session=Depends(db_dep)):
+    rows=db.query(UssdEvent).order_by(UssdEvent.created_at.desc()).limit(100).all()
+    durations=[r.duration_seconds for r in rows if r.duration_seconds is not None]
+    return {"session_count":db.query(UssdEvent).count(),"average_duration_seconds":round(sum(durations)/len(durations),1) if durations else None,"sessions":[{"session_id":r.session_id,"phone":r.phone,"duration_seconds":r.duration_seconds,"cost":r.cost,"currency":r.currency,"status":r.status,"source":r.source,"created_at":r.created_at.isoformat() if r.created_at else None} for r in rows]}
+
 @app.get("/api/ussd/messages",dependencies=[Depends(auth)])
 def ussd_messages(phoneNumber:Optional[str]=None,db:Session=Depends(db_dep)):
     query=db.query(SmsMessage)
@@ -476,9 +693,12 @@ def ussd_messages(phoneNumber:Optional[str]=None,db:Session=Depends(db_dep)):
 def assessment_questions(db,a):
     links=db.query(AssessmentQuestion).filter_by(assessment_id=a.id).order_by(AssessmentQuestion.position).all()
     return [db.get(Question,l.question_id) for l in links]
-def render_question(q,number):
+def render_question(q,number,language="en"):
     opts=sorted(q.options,key=lambda o:o.label)
-    return f"Q{number}: {q.text}\n"+"\n".join(f"{i+1}. {o.text}" for i,o in enumerate(opts))
+    prompt=(q.text_lg or q.text) if language=="lg" else q.text
+    answers=[(o.text_lg or o.text) if language=="lg" else o.text for o in opts]
+    if language=="lg" and not q.text_lg: prompt="Tandula: "+prompt
+    return f"Q{number}: {prompt}\n"+"\n".join(f"{i+1}. {answer}" for i,answer in enumerate(answers))
 
 def next_assessment_kind(db,learner):
     done={k for (k,) in db.query(Assessment.kind).join(Attempt,Attempt.assessment_id==Assessment.id).filter(Attempt.student_id==learner.id,Attempt.completed==True).distinct()}
@@ -486,22 +706,23 @@ def next_assessment_kind(db,learner):
     if "followup" not in done: return "followup"
     return None
 
-async def send_feedback(phone,attempt_id,question_id,question,correct_text,selected_text,misconception,teacher_feedback,force_demo):
+async def send_feedback(phone,attempt_id,question_id,question,correct_text,selected_text,misconception,teacher_feedback,force_demo,language="en"):
     """Runs after the USSD reply is sent, so a slow AI or SMS call can never time the session out."""
-    explanation=await generate_learning_explanation(question,correct_text,selected_text,misconception,teacher_feedback)
-    msg=f"MWALIMU\nYou selected: {selected_text}\n\n{explanation}\n\nKeep learning!"
-    status=await asyncio.to_thread(sms_send,phone,msg,force_demo)
+    explanation=await generate_learning_explanation(question,correct_text,selected_text,misconception,teacher_feedback,language)
+    msg=(f"MWALIMU\nOlondawo: {selected_text}\n\n{explanation}\n\nWeyongere okuyiga!" if language=="lg" else f"MWALIMU\nYou selected: {selected_text}\n\n{explanation}\n\nKeep learning!")
+    status,provider_id=await asyncio.to_thread(sms_send_detailed,phone,msg,force_demo)
+    response_id=None
     db=SessionLocal()
     try:
         r=db.query(Response).filter_by(attempt_id=attempt_id,question_id=question_id).first()
-        if r: r.sms_status=status
+        if r: r.sms_status=status; response_id=r.id
         db.commit()
     except Exception:
         db.rollback();logging.exception("Could not update SMS status")
     finally: db.close()
-    record_sms(phone,msg,status)
+    record_sms(phone,msg,status,provider_id,response_id)
 
-def reward_recovery(student_id,attempt_id,phone,force_demo):
+def reward_recovery(student_id,attempt_id,phone,force_demo,language="en"):
     """Airtime for a learner who showed a misconception at baseline and no longer does in the follow-up. One reward per learner."""
     db=SessionLocal()
     try:
@@ -509,11 +730,16 @@ def reward_recovery(student_id,attempt_id,phone,force_demo):
         base={m for (m,) in db.query(Response.misconception_id).join(Attempt,Attempt.id==Response.attempt_id).join(Assessment,Assessment.id==Attempt.assessment_id).filter(Attempt.student_id==student_id,Assessment.kind=="baseline",Attempt.completed==True,Response.misconception_id.isnot(None)).distinct()}
         shown={m for (m,) in db.query(Response.misconception_id).filter(Response.attempt_id==attempt_id,Response.misconception_id.isnot(None))}
         if not base or (base & shown): return
-        status=airtime_send(phone,force_demo)
-        db.add(AirtimeReward(student_id=student_id,attempt_id=attempt_id,phone=phone,amount=settings.at_airtime_amount,currency=settings.at_airtime_currency,status=status)); db.commit()
-        msg=f"MWALIMU\nWell done! You cleared a tricky idea. Airtime reward: {settings.at_airtime_currency} {settings.at_airtime_amount}."
-        sms=sms_send(phone,msg,force_demo)
-        record_sms(phone,msg,sms)
+        status,provider_id=airtime_send_detailed(phone,force_demo)
+        reward=AirtimeReward(student_id=student_id,attempt_id=attempt_id,phone=phone,amount=settings.at_airtime_amount,currency=settings.at_airtime_currency,status=status,provider_request_id=provider_id)
+        db.add(reward);db.flush()
+        if provider_id:
+            for event in db.query(ATCallbackEvent).filter_by(service="airtime",provider_id=provider_id,processed=False).order_by(ATCallbackEvent.created_at.asc()):
+                reward.status=normalize_delivery_status(event.status);event.processed=True
+        db.commit()
+        msg=(f"MWALIMU\nWeebale nnyo! Oyize bulungi. Ekirabo kya airtime: {settings.at_airtime_currency} {settings.at_airtime_amount}." if language=="lg" else f"MWALIMU\nWell done! You cleared a tricky idea. Airtime reward: {settings.at_airtime_currency} {settings.at_airtime_amount}.")
+        sms,sms_provider_id=sms_send_detailed(phone,msg,force_demo)
+        record_sms(phone,msg,sms,sms_provider_id)
     except Exception:
         db.rollback();logging.exception("Reward failed")
     finally: db.close()
@@ -524,55 +750,76 @@ def ussd_flow(db,background,session_id,phone,text,simulator):
     if not sess: sess=UssdSession(session_id=session_id,phone=phone);db.add(sess);db.commit()
     def end(msg):
         s=db.get(UssdSession,session_id)
-        if s: db.delete(s);db.commit()
+        if s:
+            if simulator:
+                started=s.started_at
+                if started and started.tzinfo is None: started=started.replace(tzinfo=timezone.utc)
+                duration=max(0,int((now()-started).total_seconds())) if started else None
+                db.merge(UssdEvent(session_id=session_id,phone=phone,duration_seconds=duration,cost=None,currency=None,status="Completed",source="web_simulator"))
+            db.delete(s);db.commit()
         return "END "+msg
-    if not parts: return "CON Welcome to Mwalimu\nUnderstand. Teach. Improve.\n1. Start quiz\n2. Exit"
-    if parts[-1]=="0": return end("Session ended. Thank you for learning.")
-    if parts[0]=="2": return end("Thank you for learning.")
-    if parts[0]!="1": return end("Invalid choice. Please dial again.")
+    if not parts: return "CON Welcome to Mwalimu\n1. Start quiz (English)\n2. Luganda\n3. Exit"
+    if parts[-1]=="0": return end("Session ended. Thank you for learning." if sess.language!="lg" else "Session eggaddwawo. Weebale okuyiga.")
+    if parts[0]=="3": return end("Thank you for learning." if sess.language!="lg" else "Weebale okuyiga.")
+    if parts[0]=="2":
+        sess.language="lg"
+        if len(parts)==1: db.commit(); return "CON Tukusaba olonde Luganda\n1. Tandika quiz\n0. Fuluma"
+    elif parts[0]=="1":
+        sess.language="en"
+    else: return end("Invalid choice. Please dial again." if sess.language!="lg" else "Ekyo tekikkirizibwa. Ddamu okugezako.")
+    lang=sess.language
+    language_prefix=1 if lang=="lg" else 0
     # Identify the learner by the phone that dialled; fall back to typing a learner ID.
     registered=db.query(Student).filter_by(phone_number=phone).first()
-    learner=registered; consumed=1
+    learner=registered; consumed=language_prefix+1
     if not learner:
-        if len(parts)==1: return "CON Enter your learner ID (example: 026):"
-        learner=db.query(Student).filter_by(student_code=parts[1]).first()
-        if not learner: return end("Learner ID not found. Ask your teacher to register you.")
-        consumed=2
+        if len(parts)==consumed: return "CON Ennyisa ennamba yo ey'omuyizi (ky'okulabirako 026):" if lang=="lg" else "CON Enter your learner ID (example: 026):"
+        learner=db.query(Student).filter_by(student_code=parts[consumed]).first()
+        if not learner: return end("Ennamba eno tegiddwa. Buuza omusomesa wo." if lang=="lg" else "Learner ID not found. Ask your teacher to register you.")
+        consumed+=1
     force_demo=simulator and settings.at_username!="sandbox"
     if len(parts)==consumed:  # start of a quiz
         kind=next_assessment_kind(db,learner)
-        if not kind: return end("You have completed all your quizzes. Well done!")
+        if not kind: return end("Omala quizzes zo zonna. Weebale nnyo!" if lang=="lg" else "You have completed all your quizzes. Well done!")
         a=db.query(Assessment).filter_by(class_id=learner.class_id,kind=kind).first()
         qs=assessment_questions(db,a) if a else []
-        if not qs: return end("No active quiz for your class.")
+        if not qs: return end("Tewali quiz eriwo mu kiraasi yo." if lang=="lg" else "No active quiz for your class.")
         attempt=Attempt(assessment_id=a.id,student_id=learner.id,total=len(qs));db.add(attempt);db.flush()
         sess.student_id=learner.id;sess.assessment_id=a.id;sess.attempt_id=attempt.id;db.commit()
-        return "CON "+render_question(qs[0],1)
+        return "CON "+render_question(qs[0],1,lang)
     a=db.get(Assessment,sess.assessment_id) if sess.assessment_id else None;attempt=db.get(Attempt,sess.attempt_id) if sess.attempt_id else None
-    if not a or not attempt: return end("Session expired. Please dial again.")
+    if not a or not attempt: return end("Ekiseera kiwedde. Ddamu okugezako." if lang=="lg" else "Session expired. Please dial again.")
     qs=assessment_questions(db,a);q_index=db.query(Response).filter_by(attempt_id=attempt.id).count()
-    if q_index>=len(qs): return end("Quiz already completed.")
+    if q_index>=len(qs): return end("Quiz ewedde dda." if lang=="lg" else "Quiz already completed.")
     q=qs[q_index];opts=sorted(q.options,key=lambda o:o.label);choice=parts[-1]
-    if not choice.isdigit() or not 1<=int(choice)<=len(opts): return "CON Invalid selection. Enter a valid option number."
+    if not choice.isdigit() or not 1<=int(choice)<=len(opts): return "CON Londa ennamba entuufu." if lang=="lg" else "CON Invalid selection. Enter a valid option number."
     selected=opts[int(choice)-1]
     db.add(Response(attempt_id=attempt.id,question_id=q.id,option_id=selected.id,correct=selected.is_correct,misconception_id=selected.misconception_id,sms_status="not_needed" if selected.is_correct else "pending"))
     if selected.is_correct: attempt.score+=1
     else:
         correct_option=next((o for o in opts if o.is_correct),None)
-        background.add_task(send_feedback,phone,attempt.id,q.id,q.text,correct_option.text if correct_option else "the correct concept",selected.text,selected.misconception.name if selected.misconception else "Review the concept",selected.feedback,force_demo)
+        correct_text=((correct_option.text_lg or correct_option.text) if lang=="lg" else correct_option.text) if correct_option else "the correct concept"
+        selected_text=(selected.text_lg or selected.text) if lang=="lg" else selected.text
+        question_text=(q.text_lg or q.text) if lang=="lg" else q.text
+        teacher_feedback=(selected.feedback_lg or "") if lang=="lg" else selected.feedback
+        background.add_task(send_feedback,phone,attempt.id,q.id,question_text,correct_text,selected_text,selected.misconception.name if selected.misconception else "Review the concept",teacher_feedback,force_demo,lang)
     nxt=q_index+1
     if nxt>=len(qs):
         attempt.completed=True;db.commit()
         if a.kind=="followup" and registered is not None:  # only reward a verified handset, never a typed-in ID
-            background.add_task(reward_recovery,learner.id,attempt.id,phone,force_demo)
-        tail=" Check your SMS feedback." if attempt.score<attempt.total else " Great work!"
-        return end(f"Quiz complete! Score: {attempt.score}/{attempt.total}."+tail)
+            background.add_task(reward_recovery,learner.id,attempt.id,phone,force_demo,lang)
+        tail=(" Laba obubaka bwa SMS." if lang=="lg" else " Check your SMS feedback.") if attempt.score<attempt.total else (" Oli mugezi nnyo!" if lang=="lg" else " Great work!")
+        prefix="Quiz ewedde! Obubonero: " if lang=="lg" else "Quiz complete! Score: "
+        return end(f"{prefix}{attempt.score}/{attempt.total}."+tail)
     db.commit()
-    return "CON "+render_question(qs[nxt],nxt+1)
+    return "CON "+render_question(qs[nxt],nxt+1,lang)
 
 @app.post("/api/ussd/callback",response_class=PlainTextResponse)
-def ussd_callback(background:BackgroundTasks,sessionId:str=Form(...),serviceCode:str=Form(""),phoneNumber:str=Form(...),text:str=Form(""),key:str=Query(default=""),simulator:bool=Header(default=False,alias="X-Mwalimu-Simulator")):
-    if settings.ussd_callback_secret and not simulator and key!=settings.ussd_callback_secret: raise HTTPException(403,"Forbidden")
+def ussd_callback(background:BackgroundTasks,sessionId:str=Form(...),serviceCode:str=Form(""),phoneNumber:str=Form(...),text:str=Form(""),key:str=Query(default=""),simulator:bool=Header(default=False,alias="X-Mwalimu-Simulator"),authorization:Optional[str]=Header(default=None)):
+    if simulator:
+        auth(authorization)
+    elif settings.ussd_callback_secret and key!=settings.ussd_callback_secret:
+        raise HTTPException(403,"Forbidden")
     db=SessionLocal()
     try: return PlainTextResponse(ussd_flow(db,background,sessionId,phoneNumber,text,simulator))
     except Exception:

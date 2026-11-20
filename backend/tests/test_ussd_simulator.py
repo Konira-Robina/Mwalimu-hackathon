@@ -1,4 +1,6 @@
 import tempfile
+import hashlib
+import time
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app import main
 
-AUTH = {"Authorization": "Bearer radar-demo-token"}
+AUTH = {"Authorization": "Bearer radar-test-session"}
 PHONE_1 = "+256700000001"
 PHONE_2 = "+256700000002"
 
@@ -55,6 +57,17 @@ def seed_test_data(db):
     db.commit()
 
 
+def seed_test_app(db):
+    seed_test_data(db)
+    teacher = db.query(main.Teacher).one()
+    db.add(main.TeacherSession(
+        token_hash=hashlib.sha256(b"radar-test-session").hexdigest(),
+        teacher_id=teacher.id,
+        expires_at=int(time.time()) + 3600,
+    ))
+    db.commit()
+
+
 @pytest.fixture
 def isolated_database(monkeypatch):
     with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
@@ -68,13 +81,14 @@ def isolated_database(monkeypatch):
         monkeypatch.setattr(main.settings, "at_enabled", False)
         monkeypatch.setattr(main.settings, "openrouter_api_key", "")
         monkeypatch.setattr(main.settings, "ussd_callback_secret", "")
-        monkeypatch.setattr(main, "seed", seed_test_data)
+        # Seed isolated data and a test-only bearer session at application startup.
+        monkeypatch.setattr(main, "seed", seed_test_app)
         yield TestSession
         engine.dispose()
 
 
 def dial(client, session_id, phone, text, simulator=True, params=None):
-    headers = {"X-Mwalimu-Simulator": "true"} if simulator else {}
+    headers = {"X-Mwalimu-Simulator": "true", "Authorization": "Bearer radar-test-session"} if simulator else {}
     return client.post(
         "/api/ussd/callback",
         data={"sessionId": session_id, "serviceCode": "*123#", "phoneNumber": phone, "text": text},
