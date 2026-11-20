@@ -1,8 +1,10 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
-import json, logging
+import asyncio, json, logging
 from typing import Optional
-from fastapi import FastAPI, Depends, HTTPException, Form, Header
+from fastapi import FastAPI, Depends, HTTPException, Form, Header, Query, BackgroundTasks
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, String, Boolean, Integer, Text, DateTime, ForeignKey, func
@@ -20,6 +22,10 @@ class Settings(BaseSettings):
     at_sender_id: str = ""
     openrouter_api_key: str = ""
     openrouter_model: str = "openai/gpt-4o-mini"
+    at_airtime_enabled: bool = False
+    at_airtime_amount: int = 500
+    at_airtime_currency: str = "UGX"
+    ussd_callback_secret: str = ""
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 settings = Settings()
 engine = create_engine(settings.database_url, connect_args={"check_same_thread":False} if settings.database_url.startswith("sqlite") else {})
@@ -105,6 +111,15 @@ class SmsMessage(Base):
     delivery_status:Mapped[str]=mapped_column(String(20),default="demo")
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
 
+class AirtimeReward(Base):
+    __tablename__="airtime_rewards"
+    id:Mapped[str]=mapped_column(String(36),primary_key=True,default=lambda:str(uuid4()))
+    student_id:Mapped[str]=mapped_column(ForeignKey("students.id"),index=True)
+    attempt_id:Mapped[str]=mapped_column(ForeignKey("quiz_attempts.id"),index=True)
+    phone:Mapped[str]=mapped_column(String(30)); amount:Mapped[int]=mapped_column(Integer); currency:Mapped[str]=mapped_column(String(3))
+    status:Mapped[str]=mapped_column(String(20),default="demo")
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+
 Base.metadata.create_all(engine)
 def db_dep():
     db=SessionLocal()
@@ -119,11 +134,37 @@ def sms_send(phone,message,force_demo=False):
     try:
         import africastalking
         africastalking.initialize(settings.at_username,settings.at_api_key)
-        kwargs={"from_":settings.at_sender_id} if settings.at_sender_id else {}
+        # The SDK parameter is `sender_id` (not `from_`).
+        kwargs={"sender_id":settings.at_sender_id} if settings.at_sender_id else {}
         result=africastalking.SMS.send(message,[phone],**kwargs)
-        logging.info("AT SMS response: %s",result); return "accepted"
+        logging.info("AT SMS response: %s",result)
+        recipients=((result or {}).get("SMSMessageData") or {}).get("Recipients") or []
+        # 100 processed, 101 sent, 102 queued. Anything else means the gateway refused it.
+        if any(str(r.get("statusCode")) not in {"100","101","102"} for r in recipients):
+            logging.warning("AT SMS not accepted: %s",result); return "failed"
+        return "accepted"
     except Exception:
         logging.exception("SMS failed"); return "failed"
+
+def airtime_send(phone,force_demo=False):
+    if force_demo or not (settings.at_enabled and settings.at_api_key and settings.at_airtime_enabled):
+        logging.info("DEMO AIRTIME %s %s to %s",settings.at_airtime_currency,settings.at_airtime_amount,phone); return "demo"
+    try:
+        import africastalking
+        africastalking.initialize(settings.at_username,settings.at_api_key)
+        result=africastalking.Airtime.send(phone_number=phone,amount=settings.at_airtime_amount,currency_code=settings.at_airtime_currency)
+        logging.info("AT airtime response: %s",result)
+        return "accepted" if int((result or {}).get("numSent",0))>0 else "failed"
+    except Exception:
+        logging.exception("Airtime failed"); return "failed"
+
+def record_sms(phone,message,status):
+    db=SessionLocal()
+    try:
+        db.add(SmsMessage(recipient=phone,message=message,delivery_status="sandbox_accepted" if status=="accepted" and settings.at_username=="sandbox" else status));db.commit()
+    except Exception:
+        db.rollback();logging.exception("Could not log SMS")
+    finally: db.close()
 
 async def generate_learning_explanation(question: str, correct_answer: str, selected_answer: str, misconception: str, teacher_feedback: str = "") -> str:
     """Generate a short learner-friendly explanation; fall back to teacher-authored feedback."""
@@ -167,6 +208,8 @@ async def generate_learning_explanation(question: str, correct_answer: str, sele
         logging.exception("OpenRouter explanation generation failed; using teacher-authored feedback")
     return fallback
 
+LIVE_DEMO_CODES={"026","027","028","029","030"}
+
 def seed(db):
     if db.query(Teacher).first(): return
     t=Teacher(name="Sarah Namusoke",email="teacher@demo.com",password_hash=pwd.hash("RadarDemo123!")); db.add(t); db.flush()
@@ -194,6 +237,7 @@ def seed(db):
         db.add(AssessmentQuestion(assessment_id=base.id,question_id=q.id,position=i));db.add(AssessmentQuestion(assessment_id=follow.id,question_id=q.id,position=i))
     db.flush()
     for i,s in enumerate(learners):
+        if s.student_code in LIVE_DEMO_CODES: continue  # fresh learners for the live demo
         for assessment,kind in [(base,"baseline"),(follow,"followup")]:
             attempt=Attempt(assessment_id=assessment.id,student_id=s.id,total=3,completed=True,score=0);db.add(attempt);db.flush()
             for qi,q in enumerate(qs):
@@ -205,14 +249,15 @@ def seed(db):
                 if selected.is_correct: attempt.score+=1
     db.commit()
 
-app=FastAPI(title="Mwalimu | Understand. Teach. Improve.",version="1.0.0",description="An AI-powered learning recovery platform that helps teachers identify learner misconceptions, provide personalised feedback, and measure learning progress.")
-app.add_middleware(CORSMiddleware,allow_origins=[settings.frontend_origin,"http://localhost:3000"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
-@app.on_event("startup")
-def startup():
+@asynccontextmanager
+async def lifespan(_app):
     d=SessionLocal()
     try: seed(d)
     finally: d.close()
+    yield
 
+app=FastAPI(lifespan=lifespan,title="Mwalimu | Understand. Teach. Improve.",version="1.0.0",description="An AI-powered learning recovery platform that helps teachers identify learner misconceptions, provide personalised feedback, and measure learning progress.")
+app.add_middleware(CORSMiddleware,allow_origins=[settings.frontend_origin,"http://localhost:3000"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 def auth(authorization:Optional[str]=Header(default=None)):
     if authorization!="Bearer radar-demo-token": raise HTTPException(401,"Please sign in.")
 @app.get("/health")
@@ -241,16 +286,42 @@ def login(x:Login,db:Session=Depends(db_dep)):
     t=db.query(Teacher).filter(func.lower(Teacher.email)==x.email.lower()).first()
     if not t or not pwd.verify(x.password,t.password_hash): raise HTTPException(401,"Invalid email or password.")
     return {"access_token":"radar-demo-token","teacher":{"name":t.name,"email":t.email}}
+def completed_cases(db,kind):
+    """Set of (student_id, misconception_id) shown in completed attempts of one assessment kind."""
+    rows=(db.query(Attempt.student_id,Response.misconception_id)
+          .join(Response,Response.attempt_id==Attempt.id).join(Assessment,Assessment.id==Attempt.assessment_id)
+          .filter(Assessment.kind==kind,Attempt.completed==True,Response.misconception_id.isnot(None)).distinct().all())
+    return {(sid,mid) for sid,mid in rows}
+
+def recovery_stats(db):
+    """Recovery only counts learners with a completed follow-up (matched pairs). Returns (per_misconception, eligible_learners, recovered_learners)."""
+    base=completed_cases(db,"baseline"); follow=completed_cases(db,"followup")
+    followed={sid for (sid,) in db.query(Attempt.student_id).join(Assessment,Assessment.id==Attempt.assessment_id).filter(Assessment.kind=="followup",Attempt.completed==True).distinct()}
+    matched={(sid,mid) for sid,mid in base if sid in followed}
+    per={}; by_student={}
+    for sid,mid in matched:
+        e,r=per.get(mid,(0,0)); per[mid]=(e+1,r+((sid,mid) not in follow)); by_student.setdefault(sid,[]).append(mid)
+    recovered=sum(1 for sid,mids in by_student.items() if all((sid,m) not in follow for m in mids))
+    return per,len(by_student),recovered
+
+def currently_affected(db):
+    """misconception_id -> learner ids whose most recent completed attempt still shows it."""
+    latest={}
+    for a in db.query(Attempt).filter(Attempt.completed==True).order_by(Attempt.created_at.asc()).all(): latest[a.student_id]=a.id
+    out={}
+    if not latest: return out
+    rows=db.query(Attempt.student_id,Response.misconception_id).join(Response,Response.attempt_id==Attempt.id).filter(Attempt.id.in_(list(latest.values())),Response.misconception_id.isnot(None)).all()
+    for sid,mid in rows: out.setdefault(mid,set()).add(sid)
+    return out
+
 @app.get("/api/dashboard/overview",dependencies=[Depends(auth)])
 def overview(db:Session=Depends(db_dep)):
-    responses=db.query(Response).all(); total=len(responses); correct=sum(r.correct for r in responses)
-    mc=db.query(Misconception).filter_by(name="Evaporation makes water disappear").first()
-    baseline=db.query(Response,Attempt).join(Attempt).join(Assessment).filter(Assessment.kind=="baseline",Response.misconception_id==mc.id).all()
-    ids={a.student_id for _,a in baseline}; recovered=0
-    for sid in ids:
-        still=db.query(Response).join(Attempt).join(Assessment).filter(Assessment.kind=="followup",Attempt.student_id==sid,Response.misconception_id==mc.id).count()
-        if not still: recovered+=1
-    return {"total_students":db.query(Student).count(),"assessments_completed":db.query(Attempt).filter_by(completed=True).count(),"average_score":round(correct/total*100,1) if total else 0,"misconceptions_detected":db.query(Misconception).count(),"recovery_rate":round(recovered/len(ids)*100,1) if ids else 0,"recovery_recovered":recovered,"recovery_eligible":len(ids),"dataset_label":"Illustrative demo data"}
+    responses=db.query(Response).join(Attempt,Attempt.id==Response.attempt_id).filter(Attempt.completed==True).all()
+    total=len(responses); correct=sum(r.correct for r in responses)
+    _,eligible,recovered=recovery_stats(db)
+    live=db.query(Attempt).join(Student,Student.id==Attempt.student_id).filter(Attempt.completed==True,Student.student_code.in_(LIVE_DEMO_CODES)).count()
+    label="Illustrative demo data" if not live else f"Illustrative demo data + {live} live attempt(s)"
+    return {"total_students":db.query(Student).count(),"assessments_completed":db.query(Attempt).filter_by(completed=True).count(),"average_score":round(correct/total*100,1) if total else 0,"misconceptions_detected":db.query(Misconception).count(),"recovery_rate":round(recovered/eligible*100,1) if eligible else 0,"recovery_recovered":recovered,"recovery_eligible":eligible,"dataset_label":label}
 @app.get("/api/classes",dependencies=[Depends(auth)])
 def classes(db:Session=Depends(db_dep)):
     return [{"id":c.id,"name":c.name,"subject":c.subject,"student_count":db.query(Student).filter_by(class_id=c.id).count()} for c in db.query(SchoolClass).all()]
@@ -345,22 +416,51 @@ def add_question(x:QuestionIn,db:Session=Depends(db_dep)):
     db.commit();db.refresh(q);return q_json(q)
 @app.get("/api/analytics/misconceptions",dependencies=[Depends(auth)])
 def misconceptions(db:Session=Depends(db_dep)):
-    out=[]
+    out=[]; now_affected=currently_affected(db)
     for m in db.query(Misconception).all():
-        rows=db.query(Response,Attempt).join(Attempt).filter(Response.misconception_id==m.id).all()
-        out.append({"id":m.id,"name":m.name,"topic":m.topic,"affected_students":len({a.student_id for _,a in rows}),"response_count":len(rows),"description":m.description,"intervention":m.intervention})
+        rows=db.query(Response,Attempt).join(Attempt).filter(Response.misconception_id==m.id,Attempt.completed==True).all()
+        out.append({"id":m.id,"name":m.name,"topic":m.topic,"affected_students":len({a.student_id for _,a in rows}),"currently_affected":len(now_affected.get(m.id,())),"response_count":len(rows),"description":m.description,"intervention":m.intervention})
     return sorted(out,key=lambda x:x["affected_students"],reverse=True)
 @app.get("/api/analytics/recovery",dependencies=[Depends(auth)])
 def recovery(db:Session=Depends(db_dep)):
-    out=[]
+    per,_,_=recovery_stats(db); out=[]
     for m in db.query(Misconception).all():
-        base=db.query(Response,Attempt).join(Attempt).join(Assessment).filter(Assessment.kind=="baseline",Response.misconception_id==m.id).all()
-        ids={a.student_id for _,a in base}; got=0
-        for sid in ids:
-            still=db.query(Response).join(Attempt).join(Assessment).filter(Assessment.kind=="followup",Attempt.student_id==sid,Response.misconception_id==m.id).count()
-            if not still: got+=1
-        out.append({"misconception":m.name,"eligible":len(ids),"recovered":got,"rate":round(got/len(ids)*100,1) if ids else 0})
+        eligible,got=per.get(m.id,(0,0))
+        out.append({"misconception":m.name,"eligible":eligible,"recovered":got,"rate":round(got/eligible*100,1) if eligible else 0})
     return {"items":out}
+
+class NotifyIn(BaseModel): message:Optional[str]=Field(default=None,max_length=300)
+def deliver_sms_batch(phones,message):
+    for phone in phones: record_sms(phone,message,sms_send(phone,message))
+@app.post("/api/misconceptions/{misconception_id}/notify",dependencies=[Depends(auth)])
+def notify_affected(misconception_id:str,background:BackgroundTasks,x:Optional[NotifyIn]=None,db:Session=Depends(db_dep)):
+    """Close the loop: SMS a revision tip to learners whose latest attempt still shows this misconception."""
+    m=db.get(Misconception,misconception_id)
+    if not m: raise HTTPException(404,"Misconception not found.")
+    ids=currently_affected(db).get(m.id,set())
+    learners=db.query(Student).filter(Student.id.in_(list(ids))).all() if ids else []
+    tip=((x.message if x else None) or "").strip() or next((o.feedback for o in db.query(Option).filter(Option.misconception_id==m.id) if o.feedback.strip()),"") or m.description
+    message=f"MWALIMU\nRevision tip from your teacher ({m.topic}): {tip}\nAsk in class if anything is unclear."
+    phones=sorted({l.phone_number for l in learners})
+    if phones: background.add_task(deliver_sms_batch,phones,message)
+    return {"misconception":m.name,"queued":len(phones)}
+
+@app.post("/api/demo/reset",dependencies=[Depends(auth)])
+def demo_reset(db:Session=Depends(db_dep)):
+    """Wipe live-demo activity (learners 026-030 and the SMS log) so the demo can be rehearsed again."""
+    ids=[s.id for s in db.query(Student).filter(Student.student_code.in_(LIVE_DEMO_CODES))]
+    if ids:
+        att=[a.id for a in db.query(Attempt).filter(Attempt.student_id.in_(ids))]
+        db.query(UssdSession).filter(UssdSession.student_id.in_(ids)).delete(synchronize_session=False)
+        if att: db.query(Response).filter(Response.attempt_id.in_(att)).delete(synchronize_session=False)
+        db.query(AirtimeReward).filter(AirtimeReward.student_id.in_(ids)).delete(synchronize_session=False)
+        db.query(Attempt).filter(Attempt.student_id.in_(ids)).delete(synchronize_session=False)
+    db.query(SmsMessage).delete(); db.commit()
+    return {"reset_learners":len(ids)}
+
+@app.get("/api/rewards",dependencies=[Depends(auth)])
+def rewards(db:Session=Depends(db_dep)):
+    return [{"student_id":r.student_id,"phone":r.phone,"amount":r.amount,"currency":r.currency,"status":r.status,"created_at":r.created_at.isoformat() if r.created_at else None} for r in db.query(AirtimeReward).order_by(AirtimeReward.created_at.desc()).limit(100)]
 @app.get("/api/assessments",dependencies=[Depends(auth)])
 def assessments(db:Session=Depends(db_dep)):
     return [{"id":a.id,"title":a.title,"type":a.kind,"question_count":len(a.questions),"published":True} for a in db.query(Assessment).all()]
@@ -376,59 +476,107 @@ def ussd_messages(phoneNumber:Optional[str]=None,db:Session=Depends(db_dep)):
 def assessment_questions(db,a):
     links=db.query(AssessmentQuestion).filter_by(assessment_id=a.id).order_by(AssessmentQuestion.position).all()
     return [db.get(Question,l.question_id) for l in links]
-@app.post("/api/ussd/callback")
-async def ussd_callback(sessionId:str=Form(...),serviceCode:str=Form(""),phoneNumber:str=Form(...),text:str=Form(""),simulator:bool=Header(default=False,alias="X-Mwalimu-Simulator")):
+def render_question(q,number):
+    opts=sorted(q.options,key=lambda o:o.label)
+    return f"Q{number}: {q.text}\n"+"\n".join(f"{i+1}. {o.text}" for i,o in enumerate(opts))
+
+def next_assessment_kind(db,learner):
+    done={k for (k,) in db.query(Assessment.kind).join(Attempt,Attempt.assessment_id==Assessment.id).filter(Attempt.student_id==learner.id,Attempt.completed==True).distinct()}
+    if "baseline" not in done: return "baseline"
+    if "followup" not in done: return "followup"
+    return None
+
+async def send_feedback(phone,attempt_id,question_id,question,correct_text,selected_text,misconception,teacher_feedback,force_demo):
+    """Runs after the USSD reply is sent, so a slow AI or SMS call can never time the session out."""
+    explanation=await generate_learning_explanation(question,correct_text,selected_text,misconception,teacher_feedback)
+    msg=f"MWALIMU\nYou selected: {selected_text}\n\n{explanation}\n\nKeep learning!"
+    status=await asyncio.to_thread(sms_send,phone,msg,force_demo)
     db=SessionLocal()
     try:
-        parts=text.split("*") if text else []; sess=db.get(UssdSession,sessionId)
-        if not sess: sess=UssdSession(session_id=sessionId,phone=phoneNumber);db.add(sess);db.commit()
-        if not parts: return "CON Welcome to Mwalimu\\nUnderstand. Teach. Improve.\\n1. Start quiz\\n2. Exit"
-        if parts[-1]=="0":
-            db.delete(sess);db.commit();return "END Session ended. Thank you for learning."
-        if parts[0]=="2": db.delete(sess);db.commit();return "END Thank you for learning."
-        if parts[0]!="1": db.delete(sess);db.commit();return "END Invalid choice. Please dial again."
-        if len(parts)==1: return "CON Enter your learner ID (example: 001):"
-        if len(parts)==2:
-            learner=db.query(Student).filter_by(student_code=parts[1]).first()
-            if not learner:return "END Learner ID not found. Ask your teacher to register you."
-            a=db.query(Assessment).filter_by(class_id=learner.class_id,kind="baseline").first()
-            if not a:return "END No active quiz for your class."
-            attempt=Attempt(assessment_id=a.id,student_id=learner.id,total=len(a.questions));db.add(attempt);db.flush()
-            sess.student_id=learner.id;sess.assessment_id=a.id;sess.attempt_id=attempt.id;db.commit()
-            q=assessment_questions(db,a)[0];opts=sorted(q.options,key=lambda o:o.label)
-            return "CON Q1: "+q.text+"\\n"+"\\n".join(f"{i+1}. {o.text}" for i,o in enumerate(opts))
-        learner=db.get(Student,sess.student_id) if sess.student_id else None;a=db.get(Assessment,sess.assessment_id) if sess.assessment_id else None;attempt=db.get(Attempt,sess.attempt_id) if sess.attempt_id else None
-        if not learner or not a or not attempt:return "END Session expired. Please dial again."
-        qs=assessment_questions(db,a);q_index=db.query(Response).filter_by(attempt_id=attempt.id).count()
-        if q_index<0 or q_index>=len(qs):return "END Quiz already completed."
-        q=qs[q_index];opts=sorted(q.options,key=lambda o:o.label);choice=parts[-1]
-        if not choice.isdigit() or int(choice)<1 or int(choice)>len(opts):return "CON Invalid selection. Enter a valid option number."
-        selected=opts[int(choice)-1]
-        if not db.query(Response).filter_by(attempt_id=attempt.id,question_id=q.id).first():
-            db.add(Response(attempt_id=attempt.id,question_id=q.id,option_id=selected.id,correct=selected.is_correct,misconception_id=selected.misconception_id))
-            if selected.is_correct:attempt.score+=1
-            else:
-                correct_option=next((o for o in opts if o.is_correct), None)
-                misconception_name=selected.misconception.name if selected.misconception else "Review the concept"
-                explanation=await generate_learning_explanation(
-                    q.text, correct_option.text if correct_option else "the correct concept",
-                    selected.text, misconception_name, selected.feedback
-                )
-                msg=f"MWALIMU\\nYou selected: {selected.text}\\n\\n{explanation}\\n\\nKeep learning!"
-                force_demo=simulator and settings.at_username!="sandbox"
-                status=sms_send(learner.phone_number,msg,force_demo=force_demo)
-                recorded_status="sandbox_accepted" if status=="accepted" and settings.at_username=="sandbox" else status
-                db.add(SmsMessage(recipient=learner.phone_number,message=msg,delivery_status=recorded_status));db.flush()
-                r=db.query(Response).filter_by(attempt_id=attempt.id,question_id=q.id).first()
-                if r:r.sms_status=status
-        next_i=q_index+1
-        if next_i>=len(qs):
-            attempt.completed=True;db.commit();db.delete(sess);db.commit()
-            return f"END Quiz complete! Score: {attempt.score}/{attempt.total}. Check your SMS feedback."
-        db.commit();nq=qs[next_i];no=sorted(nq.options,key=lambda o:o.label)
-        return "CON "+f"Q{next_i+1}: {nq.text}\\n"+"\\n".join(f"{i+1}. {o.text}" for i,o in enumerate(no))
+        r=db.query(Response).filter_by(attempt_id=attempt_id,question_id=question_id).first()
+        if r: r.sms_status=status
+        db.commit()
     except Exception:
-        db.rollback();logging.exception("USSD callback failure");return "END Sorry, something went wrong. Please try again."
-    finally:db.close()
+        db.rollback();logging.exception("Could not update SMS status")
+    finally: db.close()
+    record_sms(phone,msg,status)
+
+def reward_recovery(student_id,attempt_id,phone,force_demo):
+    """Airtime for a learner who showed a misconception at baseline and no longer does in the follow-up. One reward per learner."""
+    db=SessionLocal()
+    try:
+        if db.query(AirtimeReward).filter_by(student_id=student_id).first(): return
+        base={m for (m,) in db.query(Response.misconception_id).join(Attempt,Attempt.id==Response.attempt_id).join(Assessment,Assessment.id==Attempt.assessment_id).filter(Attempt.student_id==student_id,Assessment.kind=="baseline",Attempt.completed==True,Response.misconception_id.isnot(None)).distinct()}
+        shown={m for (m,) in db.query(Response.misconception_id).filter(Response.attempt_id==attempt_id,Response.misconception_id.isnot(None))}
+        if not base or (base & shown): return
+        status=airtime_send(phone,force_demo)
+        db.add(AirtimeReward(student_id=student_id,attempt_id=attempt_id,phone=phone,amount=settings.at_airtime_amount,currency=settings.at_airtime_currency,status=status)); db.commit()
+        msg=f"MWALIMU\nWell done! You cleared a tricky idea. Airtime reward: {settings.at_airtime_currency} {settings.at_airtime_amount}."
+        sms=sms_send(phone,msg,force_demo)
+        record_sms(phone,msg,sms)
+    except Exception:
+        db.rollback();logging.exception("Reward failed")
+    finally: db.close()
+
+def ussd_flow(db,background,session_id,phone,text,simulator):
+    parts=text.split("*") if text else []
+    sess=db.get(UssdSession,session_id)
+    if not sess: sess=UssdSession(session_id=session_id,phone=phone);db.add(sess);db.commit()
+    def end(msg):
+        s=db.get(UssdSession,session_id)
+        if s: db.delete(s);db.commit()
+        return "END "+msg
+    if not parts: return "CON Welcome to Mwalimu\nUnderstand. Teach. Improve.\n1. Start quiz\n2. Exit"
+    if parts[-1]=="0": return end("Session ended. Thank you for learning.")
+    if parts[0]=="2": return end("Thank you for learning.")
+    if parts[0]!="1": return end("Invalid choice. Please dial again.")
+    # Identify the learner by the phone that dialled; fall back to typing a learner ID.
+    registered=db.query(Student).filter_by(phone_number=phone).first()
+    learner=registered; consumed=1
+    if not learner:
+        if len(parts)==1: return "CON Enter your learner ID (example: 026):"
+        learner=db.query(Student).filter_by(student_code=parts[1]).first()
+        if not learner: return end("Learner ID not found. Ask your teacher to register you.")
+        consumed=2
+    force_demo=simulator and settings.at_username!="sandbox"
+    if len(parts)==consumed:  # start of a quiz
+        kind=next_assessment_kind(db,learner)
+        if not kind: return end("You have completed all your quizzes. Well done!")
+        a=db.query(Assessment).filter_by(class_id=learner.class_id,kind=kind).first()
+        qs=assessment_questions(db,a) if a else []
+        if not qs: return end("No active quiz for your class.")
+        attempt=Attempt(assessment_id=a.id,student_id=learner.id,total=len(qs));db.add(attempt);db.flush()
+        sess.student_id=learner.id;sess.assessment_id=a.id;sess.attempt_id=attempt.id;db.commit()
+        return "CON "+render_question(qs[0],1)
+    a=db.get(Assessment,sess.assessment_id) if sess.assessment_id else None;attempt=db.get(Attempt,sess.attempt_id) if sess.attempt_id else None
+    if not a or not attempt: return end("Session expired. Please dial again.")
+    qs=assessment_questions(db,a);q_index=db.query(Response).filter_by(attempt_id=attempt.id).count()
+    if q_index>=len(qs): return end("Quiz already completed.")
+    q=qs[q_index];opts=sorted(q.options,key=lambda o:o.label);choice=parts[-1]
+    if not choice.isdigit() or not 1<=int(choice)<=len(opts): return "CON Invalid selection. Enter a valid option number."
+    selected=opts[int(choice)-1]
+    db.add(Response(attempt_id=attempt.id,question_id=q.id,option_id=selected.id,correct=selected.is_correct,misconception_id=selected.misconception_id,sms_status="not_needed" if selected.is_correct else "pending"))
+    if selected.is_correct: attempt.score+=1
+    else:
+        correct_option=next((o for o in opts if o.is_correct),None)
+        background.add_task(send_feedback,phone,attempt.id,q.id,q.text,correct_option.text if correct_option else "the correct concept",selected.text,selected.misconception.name if selected.misconception else "Review the concept",selected.feedback,force_demo)
+    nxt=q_index+1
+    if nxt>=len(qs):
+        attempt.completed=True;db.commit()
+        if a.kind=="followup" and registered is not None:  # only reward a verified handset, never a typed-in ID
+            background.add_task(reward_recovery,learner.id,attempt.id,phone,force_demo)
+        tail=" Check your SMS feedback." if attempt.score<attempt.total else " Great work!"
+        return end(f"Quiz complete! Score: {attempt.score}/{attempt.total}."+tail)
+    db.commit()
+    return "CON "+render_question(qs[nxt],nxt+1)
+
+@app.post("/api/ussd/callback",response_class=PlainTextResponse)
+def ussd_callback(background:BackgroundTasks,sessionId:str=Form(...),serviceCode:str=Form(""),phoneNumber:str=Form(...),text:str=Form(""),key:str=Query(default=""),simulator:bool=Header(default=False,alias="X-Mwalimu-Simulator")):
+    if settings.ussd_callback_secret and not simulator and key!=settings.ussd_callback_secret: raise HTTPException(403,"Forbidden")
+    db=SessionLocal()
+    try: return PlainTextResponse(ussd_flow(db,background,sessionId,phoneNumber,text,simulator))
+    except Exception:
+        db.rollback();logging.exception("USSD callback failure");return PlainTextResponse("END Sorry, something went wrong. Please try again.")
+    finally: db.close()
 @app.get("/")
 def root():return {"app":"Mwalimu","docs":"/docs"}

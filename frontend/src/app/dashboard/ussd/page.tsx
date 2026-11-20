@@ -50,7 +50,7 @@ function formatDate(date: string | null) {
 }
 
 function displayMessage(message: string) {
-  return message.replace(/\\n/g, "\n");
+  return message;
 }
 
 function newSessionId() {
@@ -92,6 +92,18 @@ export default function UssdSimulator() {
     setSessions((current) => current.map((session) => session.id === id ? update(session) : session));
   }
 
+  // SMS feedback is sent in the background after the USSD reply, so poll the inbox for a few seconds.
+  async function refreshInbox() {
+    for (const wait of [0, 1500, 3000, 5000]) {
+      await new Promise((resolve) => setTimeout(resolve, wait));
+      try {
+        setMessages(await api<SmsMessage[]>("/api/ussd/messages"));
+      } catch {
+        /* keep the last known inbox */
+      }
+    }
+  }
+
   async function callback(session: Conversation, text: string, submitted: string) {
     setBusy(true);
     setError("");
@@ -121,8 +133,7 @@ export default function UssdSimulator() {
         ],
       }));
       if (ended) {
-        const inbox = await api<SmsMessage[]>("/api/ussd/messages");
-        setMessages(inbox);
+        void refreshInbox(); // not awaited, so the keypad stays usable
       }
     } catch (e) {
       const message = e instanceof Error ? e.message : "Could not reach the USSD service. Try again.";
